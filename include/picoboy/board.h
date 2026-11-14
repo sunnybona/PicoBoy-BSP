@@ -8,6 +8,11 @@
 #ifndef PIC0BOY_B0ARD_H
 #define PIC0BOY_B0ARD_H
 
+/* ---- BSP 版本（版本号变更时只改这里） ---- */
+#define PICOBOY_BSP_VERSION_MAJOR 2
+#define PICOBOY_BSP_VERSION_MINOR 0
+#define PICOBOY_BSP_VERSION_STRING "2.0"
+
 /* ---- 系统主频（250MHz 出厂值；供电/散热一般可改 200000） ---- */
 #ifndef PB_SYS_CLOCK_KHZ
 #define PB_SYS_CLOCK_KHZ 250000

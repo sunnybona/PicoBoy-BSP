@@ -192,36 +192,12 @@ void pb_fill_rect(int x, int y, int w, int h, uint16_t color)
             pb_fb[yy * PB_SCREEN_W + xx] = color;
 }
 
-void pb_text(int x, int y, const char *s, uint16_t fg, uint16_t bg)
-{
-    int gx = 0;
-    for(int n = 0; s[n]; n++)
-    {
-        const uint8_t *g = font3x5_glyph(s[n]);
-        for(int r = 0; r < 5; r++)
-        {
-            for(int c = 0; c < 3; c++)
-            {
-                int px = x + gx + c;
-                int py = y + r;
-                if(px < 0 || py < 0 || px >= PB_SCREEN_W || py >= PB_SCREEN_H) continue;
-                pb_fb[py * PB_SCREEN_W + px] = ((g[r] >> (2 - c)) & 1) ? fg : bg;
-            }
-        }
-        gx += 4;   /* 3 列字形 + 1 列字距 */
-    }
-}
-
-int pb_text_scaled_width(const char *s, int scale)
-{
-    int n = 0;
-    while(s[n]) n++;
-    if(n <= 0) return 0;
-    return (4 * (n - 1) + 3) * scale;
-}
-
-void pb_text_scaled(int x, int y, const char *s,
-                    uint16_t fg, uint16_t bg, int scale)
+/* 文本（3x5 点阵，字符 3x5、步进 4px）。scale 倍逐点放大：
+ *   scale=1 -> 原始大小（等价于 pb_text）
+ *   scale=2 -> 每个点画成 2x2（字符 6x10、步进 8px），标题/菜单用
+ * 与 pb_text 一样连字形的底色也写（bg），所以画在彩色底上不会透出来。 */
+void pb_text_scaled(int x, int y, const char *s, uint8_t scale,
+                    uint16_t fg, uint16_t bg)
 {
     if(scale < 1) scale = 1;
 
@@ -234,23 +210,32 @@ void pb_text_scaled(int x, int y, const char *s,
             for(int c = 0; c < 3; c++)
             {
                 uint16_t col = ((g[r] >> (2 - c)) & 1) ? fg : bg;
-                int bx = x + gx + c * scale;
-                int by = y + r * scale;
-                for(int dy = 0; dy < scale; dy++)
-                {
-                    int py = by + dy;
-                    if(py < 0 || py >= PB_SCREEN_H) continue;
-                    for(int dx = 0; dx < scale; dx++)
-                    {
-                        int px = bx + dx;
-                        if(px < 0 || px >= PB_SCREEN_W) continue;
-                        pb_fb[py * PB_SCREEN_W + px] = col;
-                    }
-                }
+                pb_fill_rect(x + gx + c * scale, y + r * scale,
+                             scale, scale, col);
             }
         }
-        gx += 4 * scale;   /* 3 列字形 + 1 列字距，随缩放放大 */
+        gx += 4 * scale;   /* 3 列字形 + 1 列字距 */
     }
+}
+
+void pb_text(int x, int y, const char *s, uint16_t fg, uint16_t bg)
+{
+    pb_text_scaled(x, y, s, 1, fg, bg);
+}
+
+int pb_text_width(const char *s, uint8_t scale)
+{
+    if(scale < 1) scale = 1;
+    int n = 0;
+    while(s[n]) n++;
+    return n ? n * 4 * (int)scale - (int)scale : 0;   /* 末字符不带字距 */
+}
+
+void pb_text_center(int y, const char *s, uint8_t scale,
+                    uint16_t fg, uint16_t bg)
+{
+    int w = pb_text_width(s, scale);
+    pb_text_scaled((PB_SCREEN_W - w) / 2, y, s, scale, fg, bg);
 }
 
 void pb_backlight(uint8_t level)
@@ -363,9 +348,8 @@ static volatile int s_tail;
 
 static int s_gb_row;
 
-/* 把 buf 的 rows 行推给面板（面板起始行 GB_FRAME_Y + row0），只在 core1 调。
- * 放 RAM：core1 线程热路径，避免 XIP 取指抖动。 */
-static void __not_in_flash_func(push_band)(const uint32_t *buf, int row0, int rows)
+/* 把 buf 的 rows 行推给面板（面板起始行 GB_FRAME_Y + row0），只在 core1 调 */
+static void push_band(const uint32_t *buf, int row0, int rows)
 {
     if(rows <= 0) return;
     lcd_begin_pixels((uint16_t)GB_FRAME_X, (uint16_t)(GB_FRAME_Y + row0),
@@ -430,25 +414,151 @@ void pb_display_end_frame(void)
     if(s_band_active) band_publish();
 }
 
-/* core1 主循环：唯一职责是把 core0 交付的每条带推给面板。驻留 RAM。 */
-static void __not_in_flash_func(core1_push_worker)(void)
+/* ================================================================== */
+/* 双核 NES 流式：240x240 全屏 1:1，4 条带 × 60 行                     */
+/* 带池吃满 pb_fb（4*60*120 个 uint32 = 115200B，正好一块 pb_fb）      */
+/* ================================================================== */
+
+#define NES_FRAME_W      240
+#define NES_FRAME_H      240
+#define NES_WORDS_PER_ROW (NES_FRAME_W / 2)
+#define NES_BAND_ROWS     (NES_FRAME_H / NES_BAND_SLOTS)
+#define NES_BAND_SLOTS    4
+
+static uint32_t *nes_band_slot_ptr(int slot)
+{
+    return reinterpret_cast<uint32_t *>(pb_fb) +
+           (size_t)slot * NES_BAND_ROWS * NES_WORDS_PER_ROW;
+}
+
+/* core0 侧：正在填的那条带 */
+static int       s_nes_band_id = -1;
+static int       s_nes_band_active;
+static int       s_nes_band_base_row;
+static int       s_nes_band_rows;
+static uint32_t *s_nes_band;
+
+/* core0 -> core1 交付环（NES_BAND_SLOTS 项） */
+typedef struct { int slot, row, rows; } nes_band_order_t;
+static volatile nes_band_order_t s_nes_ord[NES_BAND_SLOTS];
+static volatile int s_nes_head;
+static volatile int s_nes_tail;
+
+/* 把 buf 的 rows 行推给面板（面板起始行 row0），只在 core1 调 */
+static void nes_push_band(const uint32_t *buf, int row0, int rows)
+{
+    if(rows <= 0) return;
+    lcd_begin_pixels(0, (uint16_t)row0, (uint16_t)NES_FRAME_W, (uint16_t)rows);
+    push_words(buf, (size_t)rows * NES_WORDS_PER_ROW);
+    lcd_end_pixels();
+}
+
+/* 开一条新带：这块缓冲上一次装的是 id-NES_BAND_SLOTS 那条带，等它推完才能覆盖 */
+static void nes_band_open(void)
+{
+    int id = s_nes_band_id + 1;
+    while(s_nes_tail < id - NES_BAND_SLOTS + 1)
+        __asm volatile ("nop");
+
+    s_nes_band_id     = id;
+    s_nes_band        = nes_band_slot_ptr(id % NES_BAND_SLOTS);
+    s_nes_band_rows   = 0;
+    s_nes_band_active = 1;
+}
+
+/* 把当前这条带交给 core1 */
+static void nes_band_publish(void)
+{
+    if(!s_nes_band_active || s_nes_band_rows <= 0) return;
+
+    int id = s_nes_band_id;
+    int slot = id % NES_BAND_SLOTS;
+    s_nes_ord[slot].slot = slot;
+    s_nes_ord[slot].row  = s_nes_band_base_row;
+    s_nes_ord[slot].rows = s_nes_band_rows;
+    __dmb();
+    s_nes_head = id + 1;
+    __sev();
+
+    s_nes_band_active = 0;
+    s_nes_band_rows   = 0;
+}
+
+/* 取“输出第 r 行”要写的那一行缓冲；写满一条带就自动交付、开下一条 */
+static uint32_t *nes_band_row_ptr(int r)
+{
+    if(!s_nes_band_active || s_nes_band_rows >= NES_BAND_ROWS ||
+       r != s_nes_band_base_row + s_nes_band_rows)
+    {
+        if(s_nes_band_active) nes_band_publish();
+        nes_band_open();
+        s_nes_band_base_row = r;
+    }
+    s_nes_band_rows++;
+    return s_nes_band + (size_t)(s_nes_band_rows - 1) * NES_WORDS_PER_ROW;
+}
+
+void pb_display_nes_begin_frame(void)
+{
+    if(s_nes_band_active) nes_band_publish();
+}
+
+void pb_display_nes_end_frame(void)
+{
+    if(s_nes_band_active) nes_band_publish();
+}
+
+void pb_push_nes_line(const uint16_t *colors, uint8_t line)
+{
+    if(line >= NES_FRAME_H) return;
+    uint32_t *dst = nes_band_row_ptr(line);
+    for(int x = 0; x < NES_WORDS_PER_ROW; x++)
+        dst[x] = mk_pair(colors[x * 2], colors[x * 2 + 1]);
+}
+
+/* core1 主循环：唯一职责是把 core0 交付的每条带推给面板 */
+static void core1_push_worker(void)
 {
     while(true)
     {
-        while(s_head == s_tail)
+        int did = 0;
+
+        /* NES 队列 */
+        while(s_nes_head != s_nes_tail)
+        {
+            __dmb();
+            int id   = s_nes_tail;
+            int slot = s_nes_ord[id % NES_BAND_SLOTS].slot;
+            int row  = s_nes_ord[id % NES_BAND_SLOTS].row;
+            int rows = s_nes_ord[id % NES_BAND_SLOTS].rows;
+
+            nes_push_band(nes_band_slot_ptr(slot), row, rows);
+
+            __dmb();
+            s_nes_tail = id + 1;
+            __sev();
+            did = 1;
+        }
+
+        /* GB 队列 */
+        while(s_head != s_tail)
+        {
+            __dmb();
+            int id   = s_tail;
+            int slot = s_ord[id % GB_BAND_SLOTS].slot;
+            int row  = s_ord[id % GB_BAND_SLOTS].row;
+            int rows = s_ord[id % GB_BAND_SLOTS].rows;
+
+            push_band(band_slot_ptr(slot), row, rows);
+
+            __dmb();
+            s_tail = id + 1;
+            __sev();
+            did = 1;
+        }
+
+        if(!did)
             __wfe();
-
-        __dmb();
-        int id   = s_tail;
-        int slot = s_ord[id % GB_BAND_SLOTS].slot;
-        int row  = s_ord[id % GB_BAND_SLOTS].row;
-        int rows = s_ord[id % GB_BAND_SLOTS].rows;
-
-        push_band(band_slot_ptr(slot), row, rows);
-
-        __dmb();
-        s_tail = id + 1;
-        __sev();
     }
 }
 
@@ -461,7 +571,7 @@ void pb_display_start_pusher(void)
 void pb_display_wait_idle(void)
 {
     /* 忙等而非 WFI：RP2040 默认无周期 tick，USB 未接时 WFI 可能永不唤醒 */
-    while(s_tail < s_head)
+    while(s_tail < s_head || s_nes_tail < s_nes_head)
         __asm volatile ("nop");
 }
 
@@ -478,8 +588,7 @@ static void build_xmap(void)
 }
 #endif
 
-/* core0 每帧调用 144 次的热路径，驻留 RAM 减少 XIP 取指抖动 */
-void __not_in_flash_func(pb_push_gb_line)(const uint8_t *pixels, uint8_t line)
+void pb_push_gb_line(const uint8_t *pixels, uint8_t line)
 {
 #if PB_DISPLAY_SCALE15
     if(!s_xmap_ready) build_xmap();
@@ -503,6 +612,33 @@ void __not_in_flash_func(pb_push_gb_line)(const uint8_t *pixels, uint8_t line)
     for(int x = 0; x < GB_FRAME_W; x += 2)
         dst[x / 2] = mk_pair(s_pal565[pixels[x] & 3],
                              s_pal565[pixels[x + 1] & 3]);
+    s_gb_row = line + 1;
+#endif
+}
+
+/* 与 pb_push_gb_line 同样的 1.5 倍几何，但像素已经是 RGB565，不再查调色板。
+ * 用于 GBC：Walnut-CGB 把 fixPalette[pixel] 直接给出 RGB565。 */
+void pb_push_rgb_line(const uint16_t *colors, uint8_t line)
+{
+#if PB_DISPLAY_SCALE15
+    if(!s_xmap_ready) build_xmap();
+
+    int r0 = (3 * line + 1) / 2;
+    if(r0 >= GB_FRAME_H) return;
+    int r1 = (3 * (line + 1) + 1) / 2;
+    if(r1 > GB_FRAME_H) r1 = GB_FRAME_H;
+    for(int r = r0; r < r1; r++)
+    {
+        uint32_t *dst = band_row_ptr(r);
+        for(int x = 0; x < GB_FRAME_W; x += 2)
+            dst[x / 2] = mk_pair(colors[s_xmap[x]], colors[s_xmap[x + 1]]);
+    }
+    if(r1 > s_gb_row) s_gb_row = r1;
+#else
+    if(line >= GB_FRAME_H) return;
+    uint32_t *dst = band_row_ptr(line);
+    for(int x = 0; x < GB_FRAME_W; x += 2)
+        dst[x / 2] = mk_pair(colors[x], colors[x + 1]);
     s_gb_row = line + 1;
 #endif
 }

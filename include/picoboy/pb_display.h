@@ -59,12 +59,20 @@ void pb_display_set_gb_palette(const uint16_t pal4[4]);
 void pb_clear(uint16_t color);
 void pb_set_pixel(int x, int y, uint16_t color);
 void pb_fill_rect(int x, int y, int w, int h, uint16_t color);
+
+/* 内置 3x5 点阵文本。字符 3x5、步进 4px；只有 0-9 / A-Z / 少量符号
+ * （. : - / _ ? ! + 空格），小写按大写画，其他字符按空格画。 */
 void pb_text(int x, int y, const char *s, uint16_t fg, uint16_t bg);
-/* 缩放文字：3x5 字体每个像素放大 scale 倍（scale=2/3 适合菜单标题） */
-void pb_text_scaled(int x, int y, const char *s,
-                    uint16_t fg, uint16_t bg, int scale);
-/* 缩放文字占用宽度（用于居中） */
-int pb_text_scaled_width(const char *s, int scale);
+
+/* 可缩放版：scale=1 等价 pb_text，scale=2 每个点画成 2x2（标题/菜单用） */
+void pb_text_scaled(int x, int y, const char *s, uint8_t scale,
+                    uint16_t fg, uint16_t bg);
+
+/* 字符串按 scale 缩放后的像素宽度（末字符不含字距），排版/画框用 */
+int  pb_text_width(const char *s, uint8_t scale);
+
+/* 在整屏宽度内水平居中绘制*/
+void pb_text_center(int y, const char *s, uint8_t scale, uint16_t fg, uint16_t bg);
 
 /* 背光亮度 0..255（无背光脚时无效） */
 void pb_backlight(uint8_t level);
@@ -88,6 +96,22 @@ void pb_display_begin_frame(void);
 void pb_display_end_frame(void);
 /* 喂一条 GB 源扫描线（160 像素，低 2 位色号）；按 PB_DISPLAY_SCALE15 做 1.5 倍放大 */
 void pb_push_gb_line(const uint8_t *pixels, uint8_t line);
+
+/* 喂一条已上色（RGB565）的 GB 源扫描线：160 个颜色值，直接 1.5 倍放大上屏。
+ * GBC 逐像素真实色（Walnut-CGB 的 fixPalette 查表结果）走这条路径。 */
+void pb_push_rgb_line(const uint16_t *colors, uint8_t line);
+
+/* ---- 双核 NES 流式：240x240 全屏 1:1，4 条带 × 60 行 ---- */
+/* 用法（先用 pb_display_init + pb_display_start_pusher）：
+ *   pb_display_nes_begin_frame();
+ *   ... 每渲染完一条 NES 行，调 pb_push_nes_line(colors240, line);  line = 0..239
+ *   pb_display_nes_end_frame();      // 在 InfoNES_LoadFrame() 里调
+ * 带池把 pb_fb 的 115200B 全部用掉（4 槽 × 60 行 × 120 像素对），
+ * 所以这种方式和 pb_fb 帧缓冲/文本绘制互斥，菜单画完再启动推屏 worker。 */
+void pb_display_nes_begin_frame(void);
+void pb_display_nes_end_frame(void);
+/* 喂一条 240 像素的 RGB565 行（NES 256 列里居中裁剪出的 240 列），1:1 上屏 */
+void pb_push_nes_line(const uint16_t *colors, uint8_t line);
 
 #ifdef __cplusplus
 }

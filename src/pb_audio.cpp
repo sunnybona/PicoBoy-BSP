@@ -5,6 +5,12 @@
  *           每产生一个 wrap 自动从环形缓冲取下一个比较值，ISR 里重新挂 DMA 形成
  *           无限循环；CPU 只在 pb_audio_submit 时往里写，不参与逐样本输出。
  * 音调：把 PWM 载波频率直接设成目标频率，硬件持续发声。
+ *
+ * 两套模式共用同一个 PWM slice，必须显式互斥：
+ *   - 进音调（pb_tone_start / pb_audio_play_sample）：先停 slice、摘掉 DMA，再改 wrap/clkdiv。
+ *   - 出音调（pb_tone_stop）：把 DAC 的 wrap/clkdiv 还原、环形缓冲填静音中点、重挂 DMA。
+ * 不这么做的话，DMA 会在下一个 wrap 把 cc 覆盖回环形缓冲里的值：音调永远停不下来，
+ * 而且 DAC 的 wrap 一直是音调的，之后 pb_audio_submit 的样本会被按错误频率抽出来。
  */
 #include "picoboy/pb_audio.h"
 #include "picoboy/board.h"
@@ -25,8 +31,15 @@ static uint16_t s_ring[PB_AUDIO_RING];
 static uint32_t s_wp;                    /* 已写入样本总数（单调递增） */
 static volatile uint32_t s_blocks;       /* DMA 已完成的环形块数 */
 static uint8_t  s_dma_ch;
-static uint     s_slice;
+static uint  s_slice;
 static uint8_t  s_volume = 8;
+
+/* 模式状态（见文件头说明） */
+static uint8_t s_inited;                 /* pb_audio_init 已跑过 */
+static volatile uint8_t s_stream_on;     /* DMA 流式正在跑 */
+static uint8_t s_in_tone;                /* 正在发声调 */
+static uint8_t s_dac_div_i;              /* DAC 载波分频，恢复时要用 */
+static uint8_t s_dac_div_f;
 
 void pb_audio_set_volume(uint8_t vol)
 {
@@ -52,6 +65,42 @@ static void audio_dma_isr(void)
     }
 }
 
+/* 停掉流式：关 DMA 完成中断 → 关 slice（断掉 DREQ）→ 中止 DMA → 清中断标志 → GPIO 拉低。
+ * 先关中断是为了堵竞态：abort 瞬间若 ISR 还挂着，它会把通道重新挂回去。 */
+static void audio_stream_stop(void)
+{
+    if(!s_stream_on) return;
+    s_stream_on = 0;
+
+    dma_channel_set_irq0_enabled(s_dma_ch, false);
+    pwm_set_enabled(s_slice, false);
+    dma_channel_abort(s_dma_ch);
+    while(dma_channel_is_busy(s_dma_ch))
+        tight_loop_contents();
+    dma_hw->ints0 = 1u << s_dma_ch;
+    pwm_set_gpio_level(PB_PIN_AUDIO, 0);
+}
+
+/* 装回流式：还原 DAC 的 wrap/clkdiv、环形缓冲填静音中点、重启 DMA */
+static void audio_stream_start(void)
+{
+    for(uint32_t i = 0; i < PB_AUDIO_RING; i++)
+        s_ring[i] = PWM_MID;
+    s_blocks = 0;
+    s_wp = RING_HALF;              /* 预热到半满，避免读到还没写的样本 */
+
+    pwm_set_clkdiv_int_frac(s_slice, s_dac_div_i, s_dac_div_f);
+    pwm_set_wrap(s_slice, (uint16_t)PWM_WRAP);
+    pwm_set_gpio_level(PB_PIN_AUDIO, PWM_MID);
+    pwm_set_enabled(s_slice, true);
+
+    s_in_tone = 0;
+    s_stream_on = 1;
+    dma_hw->ints0 = 1u << s_dma_ch;
+    dma_channel_transfer_from_buffer_now(s_dma_ch, s_ring, PB_AUDIO_RING);
+    dma_channel_set_irq0_enabled(s_dma_ch, true);   /* 循环接上以后才允许 ISR 续流 */
+}
+
 void pb_audio_init(void)
 {
     for(uint32_t i = 0; i < PB_AUDIO_RING; i++)
@@ -69,7 +118,9 @@ void pb_audio_init(void)
     int df = (int)((div - (float)di) * 16.0f + 0.5f);
     if(df >= 16) { df = 0; di += 1; }
     if(di < 1)   { di = 1; df = 0; }
-    pwm_config_set_clkdiv_int_frac(&cfg, (uint8_t)di, (uint8_t)df);
+    s_dac_div_i = (uint8_t)di;
+    s_dac_div_f = (uint8_t)df;
+    pwm_config_set_clkdiv_int_frac(&cfg, s_dac_div_i, s_dac_div_f);
 
     pwm_init(s_slice, &cfg, true);
     pwm_set_gpio_level(PB_PIN_AUDIO, PWM_MID);
@@ -84,13 +135,12 @@ void pb_audio_init(void)
                           &pwm_hw->slice[s_slice].cc,
                           s_ring, PB_AUDIO_RING, false);
 
-    dma_channel_set_irq0_enabled(s_dma_ch, true);
+    dma_channel_set_irq0_enabled(s_dma_ch, false);   /* 由 audio_stream_start 打开 */
     irq_set_exclusive_handler(DMA_IRQ_0, audio_dma_isr);
     irq_set_enabled(DMA_IRQ_0, true);
-    dma_channel_transfer_from_buffer_now(s_dma_ch, s_ring, PB_AUDIO_RING);
 
-    /* 预热到半满，避免开机读到旧数据 */
-    s_wp = RING_HALF;
+    s_inited = 1;
+    audio_stream_start();
 }
 
 /* int16 ±32768 → PWM 比较值（中点偏置 + 音量 + 钳位） */
@@ -105,6 +155,11 @@ static inline uint16_t to_level(int16_t v)
 
 void pb_audio_submit(const int16_t *mono, size_t count)
 {
+    if(!s_inited) return;
+    /* 兜底：如果流式被停掉（例如某次音调没收尾），这里直接把 DAC 装回来 */
+    if(!s_stream_on && !s_in_tone) audio_stream_start();
+    if(!s_stream_on) return;                           /* 正在发声调，丢掉这一批 */
+
     int32_t consumed = audio_consumed();
     int32_t used = (int32_t)s_wp - consumed;          /* 环里还积压多少 */
     int32_t room = (int32_t)PB_AUDIO_RING - used - 4;  /* 留 4 个余量 */
@@ -118,21 +173,13 @@ void pb_audio_submit(const int16_t *mono, size_t count)
     }
 }
 
-void pb_audio_clear(void)
-{
-    /* 整环立刻填成中点。DMA 正在读也没关系：接下来读到的每个值都是静音，
-     * 最多带过当前这一个样本，不会出现数据错乱。 */
-    for(uint32_t i = 0; i < PB_AUDIO_RING; i++)
-        s_ring[i] = PWM_MID;
-
-    /* 写指针对齐到 DMA 当前消费位置，避免 submit 误判环满而丢掉新音频 */
-    s_wp = (uint32_t)audio_consumed();
-}
-
-/* ---- 音调（UI 用，会重配 slice，与流式不要同时用） ---- */
+/* ---- 音调（UI 用：会把 slice 切成「载波=目标频率」，DMA 必须先摘掉） ---- */
 void pb_tone_start(uint32_t freq_hz)
 {
+    if(!s_inited) return;                 /* 没初始化就别动 slice，免得踩到别的外设 */
     if(freq_hz == 0) { pb_tone_stop(); return; }
+
+    audio_stream_stop();                  /* 关键：先让 DMA 松手 */
 
     uint32_t fclk = clock_get_hz(clk_sys);
     uint32_t period_cycles = fclk / freq_hz;
@@ -152,11 +199,16 @@ void pb_tone_start(uint32_t freq_hz)
     pwm_set_wrap(s_slice, (uint16_t)(cnt - 1u));
     pwm_set_gpio_level(PB_PIN_AUDIO, (uint16_t)((cnt * s_volume) / 20u));
     pwm_set_enabled(s_slice, true);
+    s_in_tone = 1;
 }
 
 void pb_tone_stop(void)
 {
+    if(!s_inited) { pwm_set_gpio_level(PB_PIN_AUDIO, 0); return; }
+
     pwm_set_gpio_level(PB_PIN_AUDIO, 0);
+    if(s_in_tone)
+        audio_stream_start();             /* 还原 DAC 载波 + 重挂 DMA，音调不会自己再响 */
 }
 
 void pb_beep(uint32_t freq_hz, uint32_t duration_ms)
@@ -168,6 +220,10 @@ void pb_beep(uint32_t freq_hz, uint32_t duration_ms)
 
 void pb_audio_play_sample(const int16_t *samples, size_t count, uint32_t sample_rate)
 {
+    if(!s_inited) return;
+
+    audio_stream_stop();                  /* 同一套规矩：先摘 DMA 再改 wrap */
+
     pwm_set_clkdiv_int_frac(s_slice, 1, 0);
     pwm_set_wrap(s_slice, PWM_WRAP);
 
@@ -177,5 +233,7 @@ void pb_audio_play_sample(const int16_t *samples, size_t count, uint32_t sample_
         pwm_set_gpio_level(PB_PIN_AUDIO, to_level(samples[i]));
         busy_wait_us(period_us);
     }
-    pb_tone_stop();
+
+    pwm_set_gpio_level(PB_PIN_AUDIO, 0);
+    audio_stream_start();                 /* 播放完把 DAC 交还给流式 */
 }

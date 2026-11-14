@@ -32,10 +32,6 @@ void pb_audio_set_volume(uint8_t vol);
 /* 非阻塞：把单声道 16bit PCM（中心 0）写进环形缓冲；缓冲满则丢弃，不覆盖在播数据 */
 void pb_audio_submit(const int16_t *mono, size_t count);
 
-/* 立即静音：把整个环形缓冲填成中点并复位写指针（返回菜单/切游戏时用）。
- * DMA 继续运行，输出保持中点，不会有爆音。 */
-void pb_audio_clear(void);
-
 /* 非阻塞：开始/改变一个持续音调（freq=0 等同于停止）；PWM 硬件持续发声，不占 CPU */
 void pb_tone_start(uint32_t freq_hz);
 void pb_tone_stop(void);

@@ -1,46 +1,47 @@
-# PicoBoy BSP — 拿来即用的板级驱动库
+# PicoBoy BSP — 拿来即用的板级驱动库（v2.0）
 
-把已验证的 **ST7789 显示 / PWM 音频 / 按键 / 菜单** 抽成独立库，做新程序时直接链接即可。
-平台：RP2040 + ST7789 240×240，pico-sdk。
+把已验证的 **ST7789 显示 / PWM 音频 / 按键 / ROM 菜单 / 设置** 抽成独立库，做新程序时
+直接链接即可。平台：RP2040 + ST7789 240×240，pico-sdk。
+
+当前版本：**v2.0**（版本宏见 `include/picoboy/board.h`，项目版本见 `CMakeLists.txt`）。
 
 ## 目录结构
 
 ```
 picoboy_bsp/
-├── CMakeLists.txt
+├── CMakeLists.txt          # 独立构建：库 + 三个示例（project VERSION 2.0）
 ├── pico_sdk_import.cmake
 ├── include/picoboy/
-│   ├── board.h          # 引脚与硬件常量（可 -D 覆盖）
-│   ├── pb_display.h     # 显示 API
-│   ├── pb_audio.h       # 音频 API
-│   ├── pb_input.h       # 按键 API
-│   ├── pb_menu.h        # 通用列表菜单 API
-│   ├── pb_settings.h    # 数值设置界面 API（亮度/音量等）
-│   └── font3x5.h        # 内置 3×5 点阵字体
+│   ├── board.h            # 引脚/硬件常量 + 版本宏（可 -D 覆盖）
+│   ├── pb_display.h       # 显示 API（含 GB / RGB / NES 三条流式接口）
+│   ├── pb_audio.h         # 音频 API
+│   ├── pb_input.h         # 按键 API
+│   ├── pb_rom_menu.h      # 多 ROM 选择菜单（GB / NES 共用）
+│   ├── pb_settings.h      # 亮度/音量设置 + flash 持久化
+│   └── font3x5.h          # 内置 3×5 点阵字体
 ├── src/
-│   ├── st7789_lcd.pio   # 极简串行 PIO
+│   ├── st7789_lcd.pio     # 极简串行 PIO
 │   ├── pb_display.cpp
 │   ├── pb_audio.cpp
 │   ├── pb_input.cpp
-│   ├── pb_menu.cpp
+│   ├── pb_rom_menu.cpp
 │   └── pb_settings.cpp
 └── examples/
-    ├── demo.cpp        # 单核三合一演示（画图+按键+声音）
-    ├── demo_dual.cpp   # 双核演示（core1 推带 + 1.5 倍放大 + 反色）
-    ├── demo_menu.cpp   # 菜单组件演示
-    └── demo_settings.cpp # 亮度/音量设置演示
+    ├── demo.cpp           # 单核三合一（画图 + 按键 + 声音）
+    ├── demo_dual.cpp      # 双核（core1 推带 + 1.5x + 反色 + GB/RGB 两条流）
+    └── settings_demo.cpp  # 亮度/音量设置 + flash 掉电保存
 ```
 
 ## 三步接入新工程
 
-1. 把本目录复制进你的工程，在你的 `CMakeLists.txt` 里：
+1. 把本目录复制进工程，在你的 `CMakeLists.txt` 里：
 
 ```cmake
 add_subdirectory(picoboy_bsp)
 target_link_libraries(你的程序 PRIVATE picoboy)
 ```
 
-2. 包含头文件（一个总入口或按需）：
+2. 按需包含头文件：
 
 ```cpp
 #include "picoboy/pb_display.h"
@@ -56,39 +57,56 @@ target_link_libraries(你的程序 PRIVATE picoboy)
 
 ```cpp
 pb_display_init();
-pb_clear(PB_BLACK);                       // 或 PB_RGB(r,g,b)
+pb_clear(PB_BLACK);                        // 或 PB_RGB(r,g,b)
 pb_set_pixel(10, 20, PB_RED);
 pb_fill_rect(0, 0, 100, 40, PB_BLUE);
 pb_text(4, 4, "HELLO", PB_WHITE, PB_BLACK);
-pb_backlight(200);                        // 0..255
-pb_display_flush();                       // DMA 整帧上屏
+pb_text_scaled(4, 40, "BIG", 2, PB_WHITE, PB_BLACK);  // 2 倍字形
+pb_text_center(70, "CENTER", 2, PB_YELLOW, PB_BLACK); // 水平居中
+pb_backlight(200);                         // 0..255
+pb_display_flush();                        // DMA 整帧上屏
 ```
 
-帧缓冲本体 `pb_fb[240*240]` 可直接读写。省内存的流式用法：`pb_fill_screen(color)`。
+帧缓冲本体 `pb_fb[240*240]` 可直接读写；省内存的流式用法：`pb_fill_screen(color)`。
 
-### 显示：反色 + 双核 GB 流式（1.5 倍放大）
+### 显示：双核流式（core1 推带，core0 填带）
+
+GB / GBC（160×144 → 1.5x 最近邻放大到 240×216）：
 
 ```cpp
-pb_display_set_gb_palette(pal4);          // 可选：四档调色板，默认 DMG 绿
-pb_display_set_invert(true);              // 面板反色 0x21（绿色液晶 pattern）
-pb_display_start_pusher();                // 启动 core1 推屏
+pb_display_set_invert(true);               // 面板反色 0x21（绿色液晶 pattern）
+pb_display_start_pusher();                 // 启动 core1 推屏
 pb_display_begin_frame();
-for (int line = 0; line < 144; line++)
-    pb_push_gb_line(gb_source_line, line);   // 喂 160 像素源线，内部 1.5 倍放大
+for (int line = 0; line < 144; line++) {
+    pb_push_gb_line(gb_palette_line, line);   // 160 个色号 0..3，BSP 查四档绿
+    // 或 GBC 逐像素真实色：
+    pb_push_rgb_line(rgb565_line, line);      // 160 个 RGB565，直接放大上屏
+}
 pb_display_end_frame();
 ```
 
-`pb_push_gb_line` 用最近邻把 160×144 放大到 240×216，core0 填带、core1 推带，
-推屏与计算并行。完整示例见 `examples/demo_dual.cpp`。
+NES（240×240 全屏 1:1，4 条带 × 60 行）：
 
-### 音频
+```cpp
+pb_display_start_pusher();
+pb_display_nes_begin_frame();
+for (int line = 0; line < 240; line++)
+    pb_push_nes_line(rgb240_line, line);     // 240 个 RGB565
+pb_display_nes_end_frame();
+```
+
+注意：流式模式下 `pb_fb` 被当作带池复用，不能再与 `pb_clear / pb_text / pb_display_flush`
+混用。完整示例见 `examples/demo_dual.cpp`。
+
+### 音频（PWM 当 DAC，DMA 环形缓冲）
 
 ```cpp
 pb_audio_init();
-pb_audio_set_volume(8);                   // 0..10
-pb_beep(440, 200);                        // 阻塞：440Hz 响 200ms
-pb_tone_start(880);  /* ... */  pb_tone_stop();   // 非阻塞后台音
-pb_audio_play_sample(pcm, n, 22050);      // 阻塞播放短 PCM 音效
+pb_audio_set_volume(8);                     // 0..10
+pb_audio_submit(mono_pcm, n);               // 非阻塞：连续游戏音频，每帧写环
+pb_beep(440, 200);                          // 阻塞：440Hz 响 200ms
+pb_tone_start(880); /* ... */ pb_tone_stop();   // 非阻塞后台音
+pb_audio_play_sample(pcm, n, 22050);        // 阻塞：短 PCM 音效
 ```
 
 ### 按键（每帧先 poll）
@@ -101,50 +119,64 @@ if (pb_input_just_pressed(PB_BTN_UP)) { ... }
 if (pb_input_just_released(PB_BTN_B)) { ... }
 ```
 
-按键位：`PB_BTN_A/B/X/Y/UP/DOWN/LEFT/RIGHT`。
+按键位：`PB_BTN_A/B/X/Y/UP/DOWN/LEFT/RIGHT`，直连 GPIO、高有效。
 
-### 菜单（pb_menu，上/下选择，A 确认）
-
-```cpp
-static const char *items[] = { "Start", "Settings", "About" };
-pb_menu_t menu;
-pb_menu_init(&menu, "MAIN MENU", items, 3);
-int choice = pb_menu_run(&menu);    // 返回选中下标
-```
-
-菜单渲染在 `pb_fb` 上并用 `pb_display_flush` 上屏；若双核推屏在跑，内部会先等
-core1 空闲。完整示例见 `examples/demo_menu.cpp`。
-
-### 数值设置（pb_settings，上/下选择，左/右调节，B 退出）
+### ROM 菜单（pb_rom_menu，GB / NES 共用）
 
 ```cpp
-static void apply_brightness(int v) { pb_backlight((uint8_t)v); }
-
-pb_setting_item_t items[1] = {
-    { "BRIGHTNESS", 10, 255, 5, 220, apply_brightness },  // 标签,最小,最大,步进,初值,回调
+static pb_menu_item_t items[] = {
+    { "GAME ONE", "INFO LINE" },
+    { "GAME TWO", NULL },
 };
-pb_settings_t st;
-pb_settings_init(&st, "SETTINGS", items, 1);
-pb_settings_run(&st);
+pb_menu_style_t style = {
+    "PICOBOY", "SELECT ROM", "U/D MOVE  A OK", PB_WHITE
+};
+pb_rom_menu_set_setup_cb(setup_cb);   // 可选：Y 键进设置；NULL 则 Y 无效
+int choice = pb_rom_menu_select(&style, items, 2);  // 返回选中下标
+pb_rom_menu_splash(items[choice].name);             // 进游戏过场
 ```
 
-每项带名称、数值与进度条，调节时立即通过回调应用（背光/音量等）。
-完整示例见 `examples/demo_settings.cpp`。
+版式（标题栏、2 倍字形、序号、强调条、滚动三角、底部提示）由模块固定，因此两个模拟器
+菜单风格天然一致。
+
+### 设置（pb_settings，flash 持久化）
+
+```cpp
+pb_settings_init();                 // 读 flash + 立即应用（无有效数据用默认值，不写 flash）
+/* ... 菜单阶段按 Y： */
+int changed = pb_settings_menu();   // 全屏设置页，上下换项、左右调档，A/B/Y 返回
+if (changed) pb_settings_save();    // 落盘：值没变自动跳过
+const pb_settings_t *st = pb_settings_get();   // 只读当前 brightness / volume
+```
+
+亮度 1..10 档（0 档会关死背光，故不给），音量 0..10 档；值存在 flash 最后一扇区。
+**限制**：`pb_settings_save()` 擦写时 XIP 停止，只能在 core1 推屏 worker 未启动时调用。
 
 ## 编译
 
 ```bash
 export PICO_SDK_PATH=/path/to/pico-sdk
-cmake -G Ninja -B build -S .
+cmake -G Ninja -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-产物 `pb_demo.uf2`、`pb_demo_dual.uf2`、`pb_demo_menu.uf2`、
-`pb_demo_settings.uf2` 可直接烧录。
+产物 `pb_demo.uf2`、`pb_demo_dual.uf2`、`pb_settings_demo.uf2` 可直接烧录。
+
+## v1.0 → v2.0 变更
+
+- **菜单重构**：通用 `pb_menu` 升级为定版外观的 `pb_rom_menu`（GB/NES 共用），支持
+  标题/副标题/每项信息、Y 键设置回调、进游戏 splash 与 PC 预览渲染。
+- **设置持久化**：`pb_settings` 改为单例接口，亮度/音量存 flash 最后一扇区，上电自动
+  读回，值未变不擦写。
+- **新增流式接口**：`pb_push_rgb_line`（GBC 逐像素 RGB565）、`pb_push_nes_line` 与
+  NES 带帧（240×240 1:1）。
+- **flash 容量**：默认按 16MB 板定义 `PICO_FLASH_SIZE_BYTES`，可 `-DPB_FLASH_SIZE_BYTES=`
+  覆盖；链接 `hardware_flash`。
+- **版本号**：`board.h` 新增 `PICOBOY_BSP_VERSION_*` 宏，CMake project 标记 2.0.0。
 
 ## 资源占用与备注
 
-- 整帧缓冲 240×240×2 = 115,200 字节；演示固件总 RAM 约 120KB，RP2040 264KB 仍有余量。
-- 若后续做大型模拟器（内存紧张），改用 `pb_fill_screen` 等流式接口，不持有整帧缓冲。
+- 整帧缓冲 240×240×2 = 115,200 字节；示例固件 text 约 31–42KB、bss 约 122–126KB，
+  RP2040 264KB RAM 有余量。
+- 内存紧张时改用 `pb_fill_screen` / 流式接口，不持有整帧缓冲。
 - 引脚默认值见 `board.h`；换板只改这一个文件或用 `-D` 覆盖，无需动驱动源码。
-- 按键默认直连 GPIO、高有效；I2C 手柄模式可在此基础上扩展。
