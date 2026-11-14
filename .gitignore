@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+build_standalone/
+*.o
+*.a
+*.elf
+*.uf2
+*.bin
+*.hex
+*.dis
+*.map
+*.d

@@ -1,0 +1,14 @@
+;
+; st7789_lcd.pio — 极简时钟串行发送器（ST7789 4 线 SPI）
+;
+; 数据在 OUT pin 0，时钟在 side-set pin 0。
+; 两条指令发 1 个 bit：bit 时钟 = clk_sys / (2 * clkdiv)。
+; 自动 pull 在 C 侧按相位配置（命令 8 bit / 像素 32 bit）。
+;
+.program st7789_lcd
+.side_set 1
+
+.wrap_target
+    out pins, 1   side 0 ; stall here if no data (clock low)
+    nop           side 1
+.wrap
