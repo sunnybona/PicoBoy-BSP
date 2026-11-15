@@ -80,7 +80,7 @@ void pb_rom_menu_render(const pb_menu_style_t *style, const pb_menu_item_t *item
     pb_clear(MENU_BG);
 
     /* 标题栏 */
-    pb_fill_rect(0, 0, PB_SCREEN_W, 34, MENU_HEAD);
+    pb_fill_rect(0, 0, PB_FB_W, 34, MENU_HEAD);
     pb_text_center(7, style->title, 2, MENU_ACC, MENU_HEAD);
     if(style->subtitle)
         pb_text_center(23, style->subtitle, 1, PB_CYAN, MENU_HEAD);
@@ -95,7 +95,7 @@ void pb_rom_menu_render(const pb_menu_style_t *style, const pb_menu_item_t *item
 
         if(i == sel)
         {
-            pb_fill_rect(6, y - 6, PB_SCREEN_W - 12, 20, MENU_HL);
+            pb_fill_rect(6, y - 6, PB_FB_W - 12, 20, MENU_HL);
             pb_fill_rect(6, y - 6, 3, 20, MENU_ACC);      /* 左侧高亮条 */
             pb_text_scaled(MENU_ITEM_X, y, line, 2, PB_WHITE, MENU_HL);
         }
@@ -106,9 +106,9 @@ void pb_rom_menu_render(const pb_menu_style_t *style, const pb_menu_item_t *item
     }
 
     if(top > 0)
-        draw_arrow(PB_SCREEN_W - 12, MENU_LIST_Y - 2, true, MENU_DIM);
+        draw_arrow(PB_FB_W - 12, MENU_LIST_Y - 2, true, MENU_DIM);
     if(top + MENU_ROWS < count)
-        draw_arrow(PB_SCREEN_W - 12, 190, false, MENU_DIM);
+        draw_arrow(PB_FB_W - 12, 190, false, MENU_DIM);
 
     /* 选中项信息 + 操作提示 */
     if(count > 0 && items[sel].info)

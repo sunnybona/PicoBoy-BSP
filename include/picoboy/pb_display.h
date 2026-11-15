@@ -46,8 +46,8 @@ extern "C" {
 /* 初始化 PIO/DMA/ST7789，并准备整帧缓冲 */
 void pb_display_init(void);
 
-/* 整帧缓冲（240*240 个 RGB565，直接读写也行；双核 GB 流也复用这块内存） */
-extern uint16_t pb_fb[PB_SCREEN_W * PB_SCREEN_H];
+/* 帧缓冲（PB_FB_W*PB_FB_H 个 RGB565，可直接读写；双核流式也复用这块内存） */
+extern uint16_t pb_fb[PB_FB_W * PB_FB_H];
 
 /* ---- 面板反色与 GB 调色板 ---- */
 /* 面板反色：发 ST7789 的 0x21(开)/0x20(关)，用于绿色液晶 pattern */
@@ -85,6 +85,15 @@ void pb_display_flush_region(int x, int y, int w, int h);
 
 /* ---- 直接写屏（不经帧缓冲，省内存的流式用法） ---- */
 void pb_fill_screen(uint16_t color);
+
+/* 任意矩形直推，绝对面板坐标，不经帧缓冲：把 (x,y,w,h) 的 RGB565 像素按行优先
+ * 发给面板并阻塞到推完。宽度必须为偶数。第三方核心（模拟器等）按条带流式上屏
+ * 用这个，和 pb_fb/带池互不影响。 */
+void pb_display_push_rect(int x, int y, int w, int h, const uint16_t *rgb565);
+
+/* 改 MADCTL（0x36）：0x40 左右镜像、0x80 上下镜像、0xC0 旋转 180°。
+ * 需要翻转画面的核心用；窗口坐标含义不变。 */
+void pb_display_set_madctl(uint8_t madctl);
 
 /* ---- 双核 GB 流式：core1 推带，core0 填带 ---- */
 /* 启动 core1 推屏 worker（在此之前先 pb_display_init） */

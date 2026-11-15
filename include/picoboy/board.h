@@ -1,5 +1,7 @@
 /*
- * board.h — PicoBoy 板级引脚与硬件常量（RP2040 + ST7789 240x240）
+ * board.h — PicoBoy 板级引脚与硬件常量（RP2040 + ST7789，240x240 / 240x320）
+ *
+ * 面板用 PB_SCREEN_MODE 选择：0=240x240（默认），1=240x320。
  *
  * 所有引脚都可在编译时用 -D 覆盖，例如：
  *   cmake .. -DPB_PIN_LCD_SCK=6
@@ -50,10 +52,49 @@
 #define PB_LCD_CMD_HZ    8000000
 #endif
 
-/* 面板方向：0x00 正常；0x60 横屏；0xC0 上下翻；0xA0 左右翻 */
+/* ---- 面板几何配置 ----
+ * PB_SCREEN_MODE 选择物理面板：
+ *   0 = 240x240（1.3/1.54 寸 ST7789）
+ *   1 = 240x320（1.69/2.0 寸 ST7789）
+ */
+#ifndef PB_SCREEN_MODE
+#define PB_SCREEN_MODE 0
+#endif
+
+/* 物理 GRAM 尺寸 */
+#if PB_SCREEN_MODE == 1
+#define PB_PANEL_W 240
+#define PB_PANEL_H 320
+#else
+#define PB_PANEL_W 240
+#define PB_PANEL_H 240
+#endif
+
+/* LCD 旋转：0 = 竖屏/原生；1 = 横屏 90°（240x320 变成 320x240，可完整显示
+ * NES 原生 256x240）。240x240 面板旋转后几何不变。 */
+#ifndef PB_LCD_ROTATE
+#define PB_LCD_ROTATE 0
+#endif
+
+/* 面板方向寄存器：竖屏默认 0x00，横屏默认 0x60（MY|MV，常见横屏）。
+ * 可 -D 覆盖；lcd_set_window 会按 MADCTL 的 MX/MY 位自动匹配坐标，改方向不会错位。 */
 #ifndef PB_LCD_MADCTL
+#if PB_LCD_ROTATE
+#define PB_LCD_MADCTL    0x60
+#else
 #define PB_LCD_MADCTL    0x00
 #endif
+#endif
+
+/* GRAM 原点偏移（物理列/行方向）：240x240 是 240x320 GRAM 的视口，部分面板要加；
+ * 本 BSP 两种模式都从 0 起，需要时可 -D 覆盖。 */
+#ifndef PB_LCD_X_OFFSET
+#define PB_LCD_X_OFFSET   0
+#endif
+#ifndef PB_LCD_Y_OFFSET
+#define PB_LCD_Y_OFFSET   0
+#endif
+
 /* 反色：颜色发反的面板设 1 */
 #ifndef PB_LCD_INVERT
 #define PB_LCD_INVERT    1
@@ -63,8 +104,36 @@
 #define PB_DISPLAY_SCALE15 1
 #endif
 
-#define PB_SCREEN_W 240
-#define PB_SCREEN_H 240
+/* 逻辑面板尺寸（面板完整范围；旋转时宽高交换，像素总数不变）。
+ * 直接写屏(pb_fill_screen)与面板级信息用这两个。 */
+#if PB_LCD_ROTATE
+#define PB_SCREEN_W PB_PANEL_H
+#define PB_SCREEN_H PB_PANEL_W
+#else
+#define PB_SCREEN_W PB_PANEL_W
+#define PB_SCREEN_H PB_PANEL_H
+#endif
+
+/* 帧缓冲几何：画图/菜单/带池都在这块里。
+ * 竖屏铺满面板；横屏时 RP2040 264KB RAM 装不下完整 320x240，故只取 NES 原生
+ * 256x240 并水平居中（左右各留 32px 黑边），比完整 320 宽省 12800B。
+ * 三个值都可 -D 覆盖。 */
+#ifndef PB_FB_W
+#if PB_LCD_ROTATE
+#define PB_FB_W 256
+#else
+#define PB_FB_W PB_SCREEN_W
+#endif
+#endif
+#ifndef PB_FB_H
+#define PB_FB_H PB_SCREEN_H
+#endif
+#ifndef PB_FB_X
+#define PB_FB_X ((PB_SCREEN_W - PB_FB_W) / 2)
+#endif
+#ifndef PB_FB_Y
+#define PB_FB_Y ((PB_SCREEN_H - PB_FB_H) / 2)
+#endif
 
 /* ---- 音频：单 GPIO + PWM 当 DAC ---- */
 #ifndef PB_PIN_AUDIO

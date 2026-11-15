@@ -4,8 +4,9 @@
  * 能力：
  *   - 亮度 1..10 档（0 档会把背光关死、屏幕看不见，所以不给），映射到 pb_backlight(1..255)
  *   - 音量 0..10 档，直接给 pb_audio_set_volume()
+ *   - 颜色反色开关 ON/OFF，直接给 pb_display_set_invert()，出厂默认取编译期 PB_LCD_INVERT
  *   - 值存在 flash 最后一扇区，上电自动读回；值没变不擦写
- *   - 一个全屏设置页（上下换项、左右调档、A/B/Y 返回）
+ *   - 一个全屏设置页（上下换项、左右调档/切换，A/B/Y 返回）
  *
  * 典型用法（单核阶段，例如开机菜单里）：
  *   pb_display_init();
@@ -61,6 +62,7 @@ typedef struct
 {
     uint8_t brightness;      /* 1..10 */
     uint8_t volume;          /* 0..10 */
+    uint8_t invert;          /* 0 = OFF(0x20), 1 = ON(0x21) */
 } pb_settings_t;
 
 /* 读 flash 里的设置并立即应用到背光/音量；没有有效数据就用默认值（不写 flash） */
@@ -81,6 +83,7 @@ const pb_settings_t *pb_settings_get(void);
 /* 改单个值：自动钳位到合法范围，并且立即生效 */
 void pb_settings_set_brightness(uint8_t level);
 void pb_settings_set_volume(uint8_t level);
+void pb_settings_set_invert(uint8_t on);
 
 /*
  * 全屏设置页。阻塞到用户按 A / B / Y 返回。

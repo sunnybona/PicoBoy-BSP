@@ -2,7 +2,7 @@
  * pb_display.cpp — ST7789 显示驱动（PIO + DMA，RGB565）
  * 由 rp2040-gbc 已验证的 display.cpp 解耦而来。
  *
- * 两种用法共用同一块大内存 pb_fb（115200B）：
+ * 两种用法共用同一块大内存 pb_fb（240x240=115200B，240x320=153600B）：
  *   - 简单单核：pb_fb 当 uint16 帧缓冲，pb_display_flush(_region) 推屏。
  *   - 双核 GB 流：把 pb_fb 前 103680B 当 uint32“像素对”带池，core1 推带。
  * 一个程序只用其中一种，不要混用。
@@ -20,8 +20,9 @@
 
 #include "st7789_lcd.pio.h"
 
-/* 整帧缓冲：240*240*2 = 115200 字节。4 字节对齐，便于双核模式当 uint32 带池 */
-alignas(4) uint16_t pb_fb[PB_SCREEN_W * PB_SCREEN_H];
+/* 帧缓冲：竖屏铺满面板，横屏取 256x240 居中（见 board.h PB_FB_*）。
+ * 4 字节对齐，便于双核模式当 uint32 带池 */
+alignas(4) uint16_t pb_fb[PB_FB_W * PB_FB_H];
 
 static PIO   s_pio = pio0;
 static uint  s_sm;
@@ -141,17 +142,26 @@ static void lcd_cmd_data(uint8_t cmd, const uint8_t *data, size_t len)
 
 static void lcd_set_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
-    uint8_t caset[4] = { (uint8_t)(x >> 8), (uint8_t)x,
-                         (uint8_t)((x + w - 1) >> 8), (uint8_t)(x + w - 1) };
-    uint8_t raset[4] = { (uint8_t)(y >> 8), (uint8_t)y,
-                         (uint8_t)((y + h - 1) >> 8), (uint8_t)(y + h - 1) };
+    /* CASET(0x2A)/RASET(0x2B) 一律直接用逻辑坐标：竖屏逻辑即物理；横屏时
+     * 控制器按 MADCTL 的 MV 位在内部交换行列，所以这里绝不能手动换轴，
+     * 否则地址窗口与 0x2C 写入自增方向不一致，会出现 x 超 240 折回、画面紊乱。
+     * 窗口恒按起点<=终点给，MX/MY 只决定控制器的显示方向，不在此手动反向。 */
+    uint16_t col0 = (uint16_t)(x + PB_LCD_X_OFFSET);
+    uint16_t col1 = (uint16_t)(x + w - 1 + PB_LCD_X_OFFSET);
+    uint16_t row0 = (uint16_t)(y + PB_LCD_Y_OFFSET);
+    uint16_t row1 = (uint16_t)(y + h - 1 + PB_LCD_Y_OFFSET);
+    uint8_t caset[4] = { (uint8_t)(col0 >> 8), (uint8_t)col0,
+                         (uint8_t)(col1 >> 8), (uint8_t)col1 };
+    uint8_t raset[4] = { (uint8_t)(row0 >> 8), (uint8_t)row0,
+                         (uint8_t)(row1 >> 8), (uint8_t)row1 };
     lcd_cmd_data(0x2A, caset, 4);
     lcd_cmd_data(0x2B, raset, 4);
 }
 
 static void lcd_begin_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
-    lcd_set_window(x, y, w, h);
+    /* 调用方坐标都在帧缓冲空间，这里加上帧缓冲在面板里的原点 */
+    lcd_set_window((uint16_t)(x + PB_FB_X), (uint16_t)(y + PB_FB_Y), w, h);
     lcd_cmd(0x2C);
     pio_tx_idle();
     lcd_pio_configure(1);
@@ -165,31 +175,31 @@ static void lcd_end_pixels(void)
     gpio_put(PB_PIN_LCD_CS, 1);
 }
 
-/* 一行的像素对打包缓冲 */
+/* 一行的像素对打包缓冲：按面板最宽处取（pb_fill_screen 整屏填色用） */
 static uint32_t s_rowword[PB_SCREEN_W / 2];
 
 /* ---- 简单单核：帧缓冲图元 ---- */
 void pb_clear(uint16_t color)
 {
-    for(int i = 0; i < PB_SCREEN_W * PB_SCREEN_H; i++)
+    for(int i = 0; i < PB_FB_W * PB_FB_H; i++)
         pb_fb[i] = color;
 }
 
 void pb_set_pixel(int x, int y, uint16_t color)
 {
-    if(x < 0 || y < 0 || x >= PB_SCREEN_W || y >= PB_SCREEN_H) return;
-    pb_fb[y * PB_SCREEN_W + x] = color;
+    if(x < 0 || y < 0 || x >= PB_FB_W || y >= PB_FB_H) return;
+    pb_fb[y * PB_FB_W + x] = color;
 }
 
 void pb_fill_rect(int x, int y, int w, int h, uint16_t color)
 {
     int x0 = x < 0 ? 0 : x;
     int y0 = y < 0 ? 0 : y;
-    int x1 = x + w > PB_SCREEN_W ? PB_SCREEN_W : x + w;
-    int y1 = y + h > PB_SCREEN_H ? PB_SCREEN_H : y + h;
+    int x1 = x + w > PB_FB_W ? PB_FB_W : x + w;
+    int y1 = y + h > PB_FB_H ? PB_FB_H : y + h;
     for(int yy = y0; yy < y1; yy++)
         for(int xx = x0; xx < x1; xx++)
-            pb_fb[yy * PB_SCREEN_W + xx] = color;
+            pb_fb[yy * PB_FB_W + xx] = color;
 }
 
 /* 文本（3x5 点阵，字符 3x5、步进 4px）。scale 倍逐点放大：
@@ -235,7 +245,7 @@ void pb_text_center(int y, const char *s, uint8_t scale,
                     uint16_t fg, uint16_t bg)
 {
     int w = pb_text_width(s, scale);
-    pb_text_scaled((PB_SCREEN_W - w) / 2, y, s, scale, fg, bg);
+    pb_text_scaled((PB_FB_W - w) / 2, y, s, scale, fg, bg);
 }
 
 void pb_backlight(uint8_t level)
@@ -251,7 +261,7 @@ void pb_backlight(uint8_t level)
 /* 把整帧缓冲推到屏幕 */
 void pb_display_flush(void)
 {
-    pb_display_flush_region(0, 0, PB_SCREEN_W, PB_SCREEN_H);
+    pb_display_flush_region(0, 0, PB_FB_W, PB_FB_H);
 }
 
 /* 只把指定矩形区域推到屏幕（区域内按整行成对推送，宽度需为偶数） */
@@ -259,8 +269,8 @@ void pb_display_flush_region(int x, int y, int w, int h)
 {
     if(x < 0) { w += x; x = 0; }
     if(y < 0) { h += y; y = 0; }
-    if(x + w > PB_SCREEN_W) w = PB_SCREEN_W - x;
-    if(y + h > PB_SCREEN_H) h = PB_SCREEN_H - y;
+    if(x + w > PB_FB_W) w = PB_FB_W - x;
+    if(y + h > PB_FB_H) h = PB_FB_H - y;
     if(w <= 0 || h <= 0) return;
     if(w & 1) w--;                    /* 成对推送，宽度取偶数 */
     if(w <= 0) return;
@@ -268,7 +278,7 @@ void pb_display_flush_region(int x, int y, int w, int h)
     lcd_begin_pixels((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h);
     for(int yy = 0; yy < h; yy++)
     {
-        const uint16_t *row = &pb_fb[(y + yy) * PB_SCREEN_W + x];
+        const uint16_t *row = &pb_fb[(y + yy) * PB_FB_W + x];
         for(int xx = 0; xx < w / 2; xx++)
             s_rowword[xx] = mk_pair(row[2 * xx], row[2 * xx + 1]);
         push_words(s_rowword, w / 2);
@@ -276,15 +286,55 @@ void pb_display_flush_region(int x, int y, int w, int h)
     lcd_end_pixels();
 }
 
-/* 不经帧缓冲直接整屏填色（省内存） */
+/* 不经帧缓冲直接整面板填色（含黑边，清屏用），覆盖完整面板而非帧缓冲 */
 void pb_fill_screen(uint16_t color)
 {
-    lcd_begin_pixels(0, 0, PB_SCREEN_W, PB_SCREEN_H);
+    lcd_set_window(0, 0, PB_SCREEN_W, PB_SCREEN_H);
+    lcd_cmd(0x2C);
+    pio_tx_idle();
+    lcd_pio_configure(1);
+    gpio_put(PB_PIN_LCD_DC, 1);
+    gpio_put(PB_PIN_LCD_CS, 0);
     for(int x = 0; x < PB_SCREEN_W / 2; x++)
         s_rowword[x] = mk_pair(color, color);
     for(int y = 0; y < PB_SCREEN_H; y++)
         push_words(s_rowword, PB_SCREEN_W / 2);
     lcd_end_pixels();
+}
+
+/* ---- 任意矩形直推（第三方核心/模拟器流式上屏用） ---- */
+/* 绝对面板坐标，不经帧缓冲：把 (x,y,w,h) 的 RGB565 像素按行优先直接发给面板。
+ * 宽度必须是偶数（内部按像素对打包）。阻塞到 DMA 推完。 */
+void pb_display_push_rect(int x, int y, int w, int h, const uint16_t *rgb565)
+{
+    if(rgb565 == NULL || w <= 0 || h <= 0) return;
+    if(w & 1) return;
+    if(w > PB_SCREEN_W) return;
+
+    lcd_set_window((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h);
+    lcd_cmd(0x2C);
+    pio_tx_idle();
+    lcd_pio_configure(1);
+    gpio_put(PB_PIN_LCD_DC, 1);
+    gpio_put(PB_PIN_LCD_CS, 0);
+    for(int yy = 0; yy < h; yy++)
+    {
+        const uint16_t *row = &rgb565[(size_t)yy * w];
+        for(int xx = 0; xx < w / 2; xx++)
+            s_rowword[xx] = mk_pair(row[2 * xx], row[2 * xx + 1]);
+        push_words(s_rowword, (size_t)(w / 2));
+    }
+    lcd_end_pixels();
+}
+
+/* 改 MADCTL（0x36）：MX=0x40 左右镜像，MY=0x80 上下镜像，两者同时=旋转 180°。
+ * 供画面需要翻转的核心使用；窗口坐标含义不变，由面板按新方向解释。 */
+void pb_display_set_madctl(uint8_t madctl)
+{
+    pio_tx_idle();
+    uint8_t d[1] = { madctl };
+    lcd_cmd_data(0x36, d, 1);
+    lcd_cmd(0x2C);
 }
 
 /* ---- 面板反色与 GB 调色板 ---- */
@@ -304,17 +354,17 @@ void pb_display_set_gb_palette(const uint16_t pal4[4])
 /* 双核 GB 流式：半幅乒乓 + core1 推带                                  */
 /* ================================================================== */
 
-/* GB 画面在 240x240 里的几何 */
+/* GB 画面在帧缓冲里的几何（按帧缓冲 PB_FB_W/H 居中） */
 #if PB_DISPLAY_SCALE15
 #define GB_FRAME_W  240
 #define GB_FRAME_H  216
-#define GB_FRAME_X  0
-#define GB_FRAME_Y  12
+#define GB_FRAME_X  ((PB_FB_W - GB_FRAME_W) / 2)
+#define GB_FRAME_Y  ((PB_FB_H - GB_FRAME_H) / 2)   /* 240 高=12 */
 #else
 #define GB_FRAME_W  160
 #define GB_FRAME_H  144
-#define GB_FRAME_X  ((PB_SCREEN_W - 160) / 2)
-#define GB_FRAME_Y  ((PB_SCREEN_H - 144) / 2)
+#define GB_FRAME_X  ((PB_FB_W - 160) / 2)
+#define GB_FRAME_Y  ((PB_FB_H - 144) / 2)
 #endif
 
 #define GB_WORDS_PER_ROW (GB_FRAME_W / 2)
@@ -415,12 +465,21 @@ void pb_display_end_frame(void)
 }
 
 /* ================================================================== */
-/* 双核 NES 流式：240x240 全屏 1:1，4 条带 × 60 行                     */
-/* 带池吃满 pb_fb（4*60*120 个 uint32 = 115200B，正好一块 pb_fb）      */
+/* 双核 NES 流式：4 条带 × 60 行，带池复用 pb_fb                        */
+/* 竖屏：240x240 裁剪 1:1（带池 115200B）                              */
+/* 横屏：完整 256x240，填满 256 帧缓冲（带池 122880B），帧缓冲再居中    */
 /* ================================================================== */
 
+#if PB_LCD_ROTATE
+#define NES_FRAME_W      256
+#else
 #define NES_FRAME_W      240
+#endif
+/* 内容在帧缓冲内：横屏填满 256 宽，竖屏 x=0；帧缓冲在面板上的位置由 PB_FB_X 处理 */
+#define NES_FRAME_X      0
 #define NES_FRAME_H      240
+/* 帧缓冲高度即 240，垂直无偏移 */
+#define NES_FRAME_Y      0
 #define NES_WORDS_PER_ROW (NES_FRAME_W / 2)
 #define NES_BAND_ROWS     (NES_FRAME_H / NES_BAND_SLOTS)
 #define NES_BAND_SLOTS    4
@@ -444,11 +503,12 @@ static volatile nes_band_order_t s_nes_ord[NES_BAND_SLOTS];
 static volatile int s_nes_head;
 static volatile int s_nes_tail;
 
-/* 把 buf 的 rows 行推给面板（面板起始行 row0），只在 core1 调 */
+/* 把 buf 的 rows 行推给面板（逻辑起点 NES_FRAME_X, NES_FRAME_Y + row0），只在 core1 调 */
 static void nes_push_band(const uint32_t *buf, int row0, int rows)
 {
     if(rows <= 0) return;
-    lcd_begin_pixels(0, (uint16_t)row0, (uint16_t)NES_FRAME_W, (uint16_t)rows);
+    lcd_begin_pixels((uint16_t)NES_FRAME_X, (uint16_t)(NES_FRAME_Y + row0),
+                     (uint16_t)NES_FRAME_W, (uint16_t)rows);
     push_words(buf, (size_t)rows * NES_WORDS_PER_ROW);
     lcd_end_pixels();
 }
