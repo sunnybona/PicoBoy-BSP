@@ -1,9 +1,11 @@
 /*
- * pb_audio.cpp — 单 GPIO PWM 音频驱动（DMA 环形缓冲 + 可选音调/短音效）
+ * pb_audio.cpp — 单 GPIO PWM 音频驱动（DMA 连续环形 + 可选音调/短音效）
  *
- * 连续音频：PWM 固定高载波（12bit → 约 61kHz），DMA 由 PWM 的 DREQ 驱动，
- *           每产生一个 wrap 自动从环形缓冲取下一个比较值，ISR 里重新挂 DMA 形成
- *           无限循环；CPU 只在 pb_audio_submit 时往里写，不参与逐样本输出。
+ * 连续音频：PWM 固定高载波（12bit → 约 61kHz），DMA 工作在「读地址 ring」模式，
+ *           由 PWM 的 DREQ 驱动，读指针走到环形缓冲末尾时硬件自动折回开头，
+ *           传输计数给一个极大值，所以 DMA 永不停止、也不需要 ISR 重挂——
+ *           没有块边界，也就没有重挂间隙造成的周期性咔哒声。
+ *           CPU 只在 pb_audio_submit 时写样本，并通过读地址寄存器判断积压。
  * 音调：把 PWM 载波频率直接设成目标频率，硬件持续发声。
  *
  * 两套模式共用同一个 PWM slice，必须显式互斥：
@@ -20,16 +22,30 @@
 #include "hardware/pwm.h"
 #include "hardware/dma.h"
 #include "hardware/clocks.h"
-#include "hardware/irq.h"
 
 #define RING_MASK (PB_AUDIO_RING - 1u)
-#define RING_HALF (PB_AUDIO_RING / 2u)
 #define PWM_WRAP  ((1u << PB_AUDIO_PWM_BITS) - 1u)
 #define PWM_MID   (PWM_WRAP / 2u)
 
-static uint16_t s_ring[PB_AUDIO_RING];
+/* 写入余量：离读指针多近就停止写入，避免覆盖正在播放的样本 */
+#define ROOM_MARGIN 4u
+/* 启动/重同步时的预载：3/4 环 ≈ 25ms 提前量，吸收帧抖动 */
+#define PRELOAD     ((PB_AUDIO_RING * 3u) / 4u)
+
+/* 环形缓冲字节数对应的地址位数（DMA 读 ring 按 2^n 字节边界折回） */
+static constexpr uint8_t ring_addr_bits(uint32_t bytes)
+{
+    return bytes <= 1u ? 0u : (uint8_t)(1u + ring_addr_bits(bytes >> 1));
+}
+#define RING_ADDR_BITS ring_addr_bits((uint32_t)PB_AUDIO_RING * 2u)
+
+/* ring 折回要求缓冲按其字节大小对齐 */
+static uint16_t s_ring[PB_AUDIO_RING]
+    __attribute__((aligned(PB_AUDIO_RING * 2u)));
+
 static uint32_t s_wp;                    /* 已写入样本总数（单调递增） */
-static volatile uint32_t s_blocks;       /* DMA 已完成的环形块数 */
+static uint32_t s_read_total;            /* 读指针总数（按折回累计） */
+static uint32_t s_prev_ridx;             /* 上一次的环内读索引，用于识别折回 */
 static uint8_t  s_dma_ch;
 static uint  s_slice;
 static uint8_t  s_volume = 8;
@@ -41,53 +57,58 @@ static uint8_t s_in_tone;                /* 正在发声调 */
 static uint8_t s_dac_div_i;              /* DAC 载波分频，恢复时要用 */
 static uint8_t s_dac_div_f;
 
+static_assert((PB_AUDIO_RING & RING_MASK) == 0u,
+              "PB_AUDIO_RING must be a power of two");
+
 void pb_audio_set_volume(uint8_t vol)
 {
     s_volume = vol > 10 ? 10 : vol;
 }
 
-/* DMA 已消费的样本总数 */
-static inline int32_t audio_consumed(void)
+/* 当前读指针总数（硬件读地址 → 环内索引，再按折回累计） */
+static uint32_t read_position(void)
 {
-    uint32_t remaining = dma_channel_hw_addr(s_dma_ch)->transfer_count;
-    uint32_t in_block = PB_AUDIO_RING - remaining;
-    return (int32_t)(s_blocks * PB_AUDIO_RING + in_block);
+    uint32_t addr = dma_channel_hw_addr(s_dma_ch)->read_addr;
+    uint32_t ridx = (addr - (uint32_t)(uintptr_t)s_ring) >> 1;
+
+    if(ridx < s_prev_ridx)               /* 读指针折回了一次 */
+        s_read_total += PB_AUDIO_RING;
+    s_prev_ridx = ridx;
+
+    return s_read_total + ridx;
 }
 
-static void audio_dma_isr(void)
+/* 欠载重同步：整环填静音中点，写指针重新拉到读指针前 PRELOAD 处。
+ * 这样即使供数跟不上，也只会出现一小段干净的静音，而不是重复旧音频。 */
+static void resync(uint32_t rpos)
 {
-    uint32_t mask = 1u << s_dma_ch;
-    if(dma_hw->ints0 & mask)
-    {
-        dma_hw->ints0 = mask;
-        s_blocks++;
-        dma_channel_transfer_from_buffer_now(s_dma_ch, s_ring, PB_AUDIO_RING);
-    }
+    for(uint32_t i = 0; i < PB_AUDIO_RING; i++)
+        s_ring[i] = PWM_MID;
+    s_wp = rpos + PRELOAD;
 }
 
-/* 停掉流式：关 DMA 完成中断 → 关 slice（断掉 DREQ）→ 中止 DMA → 清中断标志 → GPIO 拉低。
- * 先关中断是为了堵竞态：abort 瞬间若 ISR 还挂着，它会把通道重新挂回去。 */
+/* 停掉流式：关 slice（断掉 DREQ）→ 中止 DMA → GPIO 拉低。 */
 static void audio_stream_stop(void)
 {
     if(!s_stream_on) return;
     s_stream_on = 0;
 
-    dma_channel_set_irq0_enabled(s_dma_ch, false);
     pwm_set_enabled(s_slice, false);
     dma_channel_abort(s_dma_ch);
     while(dma_channel_is_busy(s_dma_ch))
         tight_loop_contents();
-    dma_hw->ints0 = 1u << s_dma_ch;
     pwm_set_gpio_level(PB_PIN_AUDIO, 0);
 }
 
-/* 装回流式：还原 DAC 的 wrap/clkdiv、环形缓冲填静音中点、重启 DMA */
+/* 装回流式：还原 DAC 的 wrap/clkdiv、环形缓冲填静音中点、重挂连续 ring DMA */
 static void audio_stream_start(void)
 {
     for(uint32_t i = 0; i < PB_AUDIO_RING; i++)
         s_ring[i] = PWM_MID;
-    s_blocks = 0;
-    s_wp = RING_HALF;              /* 预热到半满，避免读到还没写的样本 */
+
+    s_read_total = 0;
+    s_prev_ridx = 0;
+    s_wp = PRELOAD;
 
     pwm_set_clkdiv_int_frac(s_slice, s_dac_div_i, s_dac_div_f);
     pwm_set_wrap(s_slice, (uint16_t)PWM_WRAP);
@@ -96,9 +117,8 @@ static void audio_stream_start(void)
 
     s_in_tone = 0;
     s_stream_on = 1;
-    dma_hw->ints0 = 1u << s_dma_ch;
-    dma_channel_transfer_from_buffer_now(s_dma_ch, s_ring, PB_AUDIO_RING);
-    dma_channel_set_irq0_enabled(s_dma_ch, true);   /* 循环接上以后才允许 ISR 续流 */
+    /* 极大传输计数 + 读 ring：硬件自动折回，永不停止，无需 ISR */
+    dma_channel_transfer_from_buffer_now(s_dma_ch, s_ring, 0xFFFFFFFFu);
 }
 
 void pb_audio_init(void)
@@ -131,13 +151,10 @@ void pb_audio_init(void)
     channel_config_set_read_increment(&c, true);
     channel_config_set_write_increment(&c, false);
     channel_config_set_dreq(&c, pwm_get_dreq(s_slice));
+    channel_config_set_ring(&c, false, RING_ADDR_BITS);
     dma_channel_configure(s_dma_ch, &c,
                           &pwm_hw->slice[s_slice].cc,
-                          s_ring, PB_AUDIO_RING, false);
-
-    dma_channel_set_irq0_enabled(s_dma_ch, false);   /* 由 audio_stream_start 打开 */
-    irq_set_exclusive_handler(DMA_IRQ_0, audio_dma_isr);
-    irq_set_enabled(DMA_IRQ_0, true);
+                          s_ring, 0, false);
 
     s_inited = 1;
     audio_stream_start();
@@ -160,10 +177,17 @@ void pb_audio_submit(const int16_t *mono, size_t count)
     if(!s_stream_on && !s_in_tone) audio_stream_start();
     if(!s_stream_on) return;                           /* 正在发声调，丢掉这一批 */
 
-    int32_t consumed = audio_consumed();
-    int32_t used = (int32_t)s_wp - consumed;          /* 环里还积压多少 */
-    int32_t room = (int32_t)PB_AUDIO_RING - used - 4;  /* 留 4 个余量 */
-    if(room <= 0) return;                               /* 满了，丢弃，不覆盖在播数据 */
+    uint32_t rpos = read_position();
+    int32_t used = (int32_t)(s_wp - rpos);             /* 环里还积压多少 */
+
+    if(used <= 0)                                      /* 供数跟不上：欠载重同步 */
+    {
+        resync(rpos);
+        used = (int32_t)PRELOAD;
+    }
+
+    int32_t room = (int32_t)PB_AUDIO_RING - used - (int32_t)ROOM_MARGIN;
+    if(room <= 0) return;                              /* 满了，丢弃，不覆盖在播数据 */
 
     size_t n = count < (size_t)room ? count : (size_t)room;
     for(size_t i = 0; i < n; i++)
