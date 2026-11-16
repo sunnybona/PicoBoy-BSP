@@ -11,12 +11,23 @@ pico_sdk_init()
 # ---- 可复用板级库 ----
 add_library(picoboy STATIC
     src/pb_display.cpp
-    src/pb_audio.cpp
     src/pb_input.cpp
     src/pb_settings.cpp
     src/pb_rom_menu.cpp
     src/pb_flash_rom.cpp
 )
+
+# 音频后端：0=单 GPIO PWM 当 DAC（默认），1=PIO I2S（外部 I2S DAC）。
+set(PB_AUDIO_I2S 0 CACHE STRING "Audio backend: 0=PWM DAC, 1=PIO I2S")
+set_property(CACHE PB_AUDIO_I2S PROPERTY STRINGS 0 1)
+if(PB_AUDIO_I2S)
+    target_sources(picoboy PRIVATE src/pb_audio_i2s.cpp)
+    target_compile_definitions(picoboy PUBLIC PB_AUDIO_I2S=1)
+    pico_generate_pio_header(picoboy ${CMAKE_CURRENT_LIST_DIR}/src/pb_i2s.pio)
+else()
+    target_sources(picoboy PRIVATE src/pb_audio.cpp)
+    target_compile_definitions(picoboy PUBLIC PB_AUDIO_I2S=0)
+endif()
 
 target_include_directories(picoboy PUBLIC include)
 

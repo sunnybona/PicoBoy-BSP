@@ -151,6 +151,22 @@
 #define PB_AUDIO_SAMPLE_RATE 61035
 #endif
 
+/* ---- I2S 音频（PIO + 外部 I2S DAC，如 MAX98357A）。
+ * PB_AUDIO_I2S=1 时音频走 PIO I2S，PWM 引脚 11 不再使用；默认 0=PWM。
+ * 两个 side-set 时钟脚必须相邻：BCLK 在前、LRCLK 紧随其后。 */
+#ifndef PB_AUDIO_I2S
+#define PB_AUDIO_I2S 0
+#endif
+#ifndef PB_PIN_I2S_DATA
+#define PB_PIN_I2S_DATA   13
+#endif
+#ifndef PB_PIN_I2S_BCLK
+#define PB_PIN_I2S_BCLK   14
+#endif
+#ifndef PB_PIN_I2S_LRCLK
+#define PB_PIN_I2S_LRCLK  15
+#endif
+
 /* ---- 按键：直连 GPIO，高电平有效（外部下拉，按下接 VCC） ---- */
 #ifndef PB_PIN_BTN_A
 #define PB_PIN_BTN_A      18
