@@ -142,21 +142,31 @@
 #ifndef PB_AUDIO_PWM_BITS
 #define PB_AUDIO_PWM_BITS 12
 #endif
-/* 音频环形缓冲（样本数，必须是 2 的幂）。2048 ≈ 33ms。 */
+/* I2S 后端开关默认值（需在环形缓冲尺寸之前确定；CMake 会用 -D 覆盖）。 */
+#ifndef PB_AUDIO_I2S
+#define PB_AUDIO_I2S 0
+#endif
+
+/* 音频环形缓冲（样本数，必须是 2 的幂）。
+ * PWM 用 2048（uint16，4KB）；I2S 每帧是 32bit，2048 会占 8KB 且要求 8KB
+ * 对齐，在 RAM 本就紧张的 NES 上放不下，故 I2S 用 1024（4KB，预载约 17ms
+ * 仍能覆盖一帧），缓冲宽度与对齐都和 PWM 一致。 */
 #ifndef PB_AUDIO_RING
+#if PB_AUDIO_I2S
+#define PB_AUDIO_RING 1024
+#else
 #define PB_AUDIO_RING 2048
 #endif
-/* 采样率 = PWM 载波：250MHz / 2^12 ≈ 61035；APU 也用同一速率。 */
+#endif
+/* 采样率：标准 44100。PWM 与 I2S 后端、APU 都用同一速率。
+ * （PWM 载波由分频独立产生，不与采样率绑定。） */
 #ifndef PB_AUDIO_SAMPLE_RATE
-#define PB_AUDIO_SAMPLE_RATE 61035
+#define PB_AUDIO_SAMPLE_RATE 44100
 #endif
 
 /* ---- I2S 音频（PIO + 外部 I2S DAC，如 MAX98357A）。
  * PB_AUDIO_I2S=1 时音频走 PIO I2S，PWM 引脚 11 不再使用；默认 0=PWM。
  * 两个 side-set 时钟脚必须相邻：BCLK 在前、LRCLK 紧随其后。 */
-#ifndef PB_AUDIO_I2S
-#define PB_AUDIO_I2S 0
-#endif
 #ifndef PB_PIN_I2S_DATA
 #define PB_PIN_I2S_DATA   13
 #endif
